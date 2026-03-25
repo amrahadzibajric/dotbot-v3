@@ -1,5 +1,6 @@
 using Dotbot.Server.Models;
 using Microsoft.Extensions.Options;
+using System.Collections.Concurrent;
 using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
@@ -11,6 +12,9 @@ public class SlackDeliveryProvider : IQuestionDeliveryProvider
     private readonly IHttpClientFactory _httpClientFactory;
     private readonly SlackChannelSettings _settings;
     private readonly ILogger<SlackDeliveryProvider> _logger;
+
+    // Cache Slack display names to avoid a users.info call on every delivery
+    private readonly ConcurrentDictionary<string, string> _nameCache = new();
 
     public string ChannelName => "slack";
 
@@ -47,8 +51,9 @@ public class SlackDeliveryProvider : IQuestionDeliveryProvider
             };
         }
 
+        var displayName = await ResolveDisplayNameAsync(slackUserId, ct);
         var template = context.Template;
-        var blocks = BuildBlocks(template, context.MagicLinkUrl, context.IsReminder, context.Recipient.DisplayName);
+        var blocks = BuildBlocks(template, context.MagicLinkUrl, context.IsReminder, displayName);
 
         var payload = new
         {
@@ -106,6 +111,55 @@ public class SlackDeliveryProvider : IQuestionDeliveryProvider
         return new DeliveryResult { Success = true, Channel = ChannelName };
     }
 
+    private async Task<string?> ResolveDisplayNameAsync(string slackUserId, CancellationToken ct)
+    {
+        if (_nameCache.TryGetValue(slackUserId, out var cached))
+            return cached;
+
+        try
+        {
+            var client = _httpClientFactory.CreateClient();
+            client.DefaultRequestHeaders.Authorization =
+                new AuthenticationHeaderValue("Bearer", _settings.BotToken);
+
+            var response = await client.GetAsync(
+                $"https://slack.com/api/users.info?user={Uri.EscapeDataString(slackUserId)}", ct);
+
+            var body = await response.Content.ReadAsStringAsync(ct);
+            using var doc = JsonDocument.Parse(body);
+            var root = doc.RootElement;
+
+            if (!root.TryGetProperty("ok", out var okProp) || !okProp.GetBoolean())
+            {
+                _logger.LogWarning("users.info failed for {UserId}: {Body}", slackUserId, body);
+                return null;
+            }
+
+            var profile = root.GetProperty("user").GetProperty("profile");
+
+            // Prefer first_name, fall back to display_name, then real_name
+            var name =
+                TryGetString(profile, "first_name") ??
+                TryGetString(profile, "display_name") ??
+                TryGetString(profile, "real_name");
+
+            if (!string.IsNullOrWhiteSpace(name))
+                _nameCache[slackUserId] = name;
+
+            return name;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Could not resolve display name for Slack user {UserId}", slackUserId);
+            return null;
+        }
+    }
+
+    private static string? TryGetString(JsonElement element, string property) =>
+        element.TryGetProperty(property, out var prop) && prop.ValueKind == JsonValueKind.String
+            ? prop.GetString() is { Length: > 0 } s ? s : null
+            : null;
+
     private static List<object> BuildBlocks(QuestionTemplate template, string? magicLinkUrl, bool isReminder, string? displayName)
     {
         var blocks = new List<object>();
@@ -115,36 +169,41 @@ public class SlackDeliveryProvider : IQuestionDeliveryProvider
         {
             blocks.Add(new
             {
-                type = "section",
-                text = new { type = "mrkdwn", text = ":warning: *Reminder:* This question is still awaiting your response." }
+                type = "context",
+                elements = new[] { new { type = "mrkdwn", text = ":wave: *Reminder* — this question is still waiting for your response." } }
             });
-            blocks.Add(new { type = "divider" });
         }
 
-        // Project header
-        if (!string.IsNullOrWhiteSpace(template.Project.Name))
-        {
-            var projectText = $"*{Escape(template.Project.Name)}*";
-            if (!string.IsNullOrWhiteSpace(template.Project.Description))
-                projectText += $"\n{Escape(template.Project.Description)}";
+        // Question title — header block is the focal point
+        var title = template.Title ?? "";
+        var firstName = ExtractFirstName(displayName);
+        var headerText = (!string.IsNullOrWhiteSpace(firstName) && firstName != "there")
+            ? $"Hi {firstName}, {char.ToLower(title[0])}{title[1..]}"
+            : title;
 
+        blocks.Add(new
+        {
+            type = "header",
+            text = new { type = "plain_text", text = headerText.Length <= 150 ? headerText : title, emoji = false }
+        });
+
+        // Project + context as a compact metadata line
+        var metaParts = new List<string>();
+        if (!string.IsNullOrWhiteSpace(template.Project.Name))
+            metaParts.Add($":robot_face: {Escape(template.Project.Name)}");
+        if (!string.IsNullOrWhiteSpace(template.Project.Description))
+            metaParts.Add(Escape(template.Project.Description));
+
+        if (metaParts.Count > 0)
+        {
             blocks.Add(new
             {
                 type = "context",
-                elements = new[] { new { type = "mrkdwn", text = projectText } }
+                elements = new[] { new { type = "mrkdwn", text = string.Join("  ·  ", metaParts) } }
             });
         }
 
-        // Greeting + question title
-        var firstName = ExtractFirstName(displayName);
-        var headerText = $"Hi {Escape(firstName)}, we need your expertise to help advance the project.\n\n*{Escape(template.Title)}*";
-        blocks.Add(new
-        {
-            type = "section",
-            text = new { type = "mrkdwn", text = headerText }
-        });
-
-        // Context
+        // Context paragraph
         if (!string.IsNullOrWhiteSpace(template.Context))
         {
             blocks.Add(new
@@ -154,15 +213,15 @@ public class SlackDeliveryProvider : IQuestionDeliveryProvider
             });
         }
 
-        blocks.Add(new { type = "divider" });
-
-        // Options
+        // Options — compact single block, just enough to inform the decision
         var optionsText = new StringBuilder();
         foreach (var option in template.Options)
         {
-            optionsText.Append($"*{Escape(option.Key)}*  {Escape(option.Title)}");
+            optionsText.Append(option.IsRecommended
+                ? $"*{Escape(option.Key)}*  {Escape(option.Title)} ✅"
+                : $"*{Escape(option.Key)}*  {Escape(option.Title)}");
             if (!string.IsNullOrWhiteSpace(option.Summary))
-                optionsText.Append($"\n_{Escape(option.Summary)}_");
+                optionsText.Append($"  —  _{Escape(option.Summary)}_");
             optionsText.AppendLine();
         }
 
