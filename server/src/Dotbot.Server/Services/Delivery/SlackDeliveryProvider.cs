@@ -174,10 +174,11 @@ public class SlackDeliveryProvider : IQuestionDeliveryProvider
             });
         }
 
-        // Question title — header block is the focal point
-        var title = template.Title ?? "";
+        // Question title 
+        var title = string.IsNullOrWhiteSpace(template.Title) ? "Input needed" : template.Title;
         var firstName = ExtractFirstName(displayName);
-        var headerText = (!string.IsNullOrWhiteSpace(firstName) && firstName != "there")
+        var personalised = !string.IsNullOrWhiteSpace(firstName) && firstName != "there";
+        var headerText = personalised
             ? $"Hi {firstName}, {char.ToLower(title[0])}{title[1..]}"
             : title;
 

@@ -387,11 +387,13 @@ try
                     (!string.IsNullOrEmpty(resp.ResponderAadObjectId) && !string.IsNullOrEmpty(r.AadObjectId)
                         && string.Equals(resp.ResponderAadObjectId, r.AadObjectId, StringComparison.OrdinalIgnoreCase))
                     || (!string.IsNullOrEmpty(resp.ResponderEmail) && !string.IsNullOrEmpty(r.Email)
-                        && string.Equals(resp.ResponderEmail, r.Email, StringComparison.OrdinalIgnoreCase)));
+                        && string.Equals(resp.ResponderEmail, r.Email, StringComparison.OrdinalIgnoreCase))
+                    || (!string.IsNullOrEmpty(resp.ResponderEmail) && !string.IsNullOrEmpty(r.SlackUserId)
+                        && string.Equals(resp.ResponderEmail, r.SlackUserId, StringComparison.OrdinalIgnoreCase)));
 
                 return new
                 {
-                    email = r.Email,
+                    email = r.Email ?? r.SlackUserId,
                     aadObjectId = r.AadObjectId,
                     channel = r.Channel,
                     status = r.Status,
