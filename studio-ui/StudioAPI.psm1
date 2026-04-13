@@ -239,16 +239,33 @@ function Invoke-StudioRequest {
     $method = $req.HttpMethod
     $path = $req.Url.AbsolutePath
 
-    # Add CORS headers
-    $res.Headers.Add('Access-Control-Allow-Origin', '*')
-    $res.Headers.Add('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS')
-    $res.Headers.Add('Access-Control-Allow-Headers', 'Content-Type')
+    # CORS: restrict to same-origin (localhost) requests only.
+    # Determine the request origin and allow it only when it matches localhost on the listening port.
+    $requestOrigin = $req.Headers['Origin']
+    if ($requestOrigin) {
+        if ($requestOrigin -match '^https?://localhost(:\d+)?$' -or $requestOrigin -match '^https?://127\.0\.0\.1(:\d+)?$') {
+            $res.Headers.Add('Access-Control-Allow-Origin', $requestOrigin)
+            $res.Headers.Add('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS')
+            $res.Headers.Add('Access-Control-Allow-Headers', 'Content-Type, X-Dotbot-Request')
+        }
+        # Non-localhost origins get no CORS headers → browser blocks the response.
+    }
 
     # Handle CORS preflight
     if ($method -eq 'OPTIONS') {
         $res.StatusCode = 204
         $res.Close()
         return $true
+    }
+
+    # CSRF protection: require X-Dotbot-Request header on state-changing requests.
+    # Browsers enforce CORS preflight for custom headers, blocking cross-origin attacks.
+    if ($method -in @('POST', 'PUT', 'DELETE')) {
+        $csrfHeader = $req.Headers['X-Dotbot-Request']
+        if ($csrfHeader -ne '1') {
+            Send-Error -Response $res -Message 'Missing CSRF header' -StatusCode 403
+            return $true
+        }
     }
 
     try {

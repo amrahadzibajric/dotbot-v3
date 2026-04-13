@@ -20,6 +20,67 @@ function Initialize-AetherAPI {
     $script:Config.ControlDir = $ControlDir
 }
 
+<#
+.SYNOPSIS
+Validates that an IP address belongs to a private/link-local range (RFC 1918 / RFC 3927).
+Used to guard -SkipCertificateCheck calls so they only target local Hue bridges.
+#>
+function Test-PrivateIPAddress {
+    param([string]$IP)
+    try {
+        $addr = [System.Net.IPAddress]::Parse($IP)
+        $bytes = $addr.GetAddressBytes()
+        # 10.0.0.0/8
+        if ($bytes[0] -eq 10) { return $true }
+        # 172.16.0.0/12
+        if ($bytes[0] -eq 172 -and $bytes[1] -ge 16 -and $bytes[1] -le 31) { return $true }
+        # 192.168.0.0/16
+        if ($bytes[0] -eq 192 -and $bytes[1] -eq 168) { return $true }
+        # 169.254.0.0/16 (link-local)
+        if ($bytes[0] -eq 169 -and $bytes[1] -eq 254) { return $true }
+        # 127.0.0.0/8 (loopback)
+        if ($bytes[0] -eq 127) { return $true }
+        return $false
+    } catch {
+        return $false
+    }
+}
+
+<#
+.SYNOPSIS
+Wrapper around Invoke-RestMethod that only skips certificate validation for private IPs.
+Hue bridges use self-signed certs, so -SkipCertificateCheck is required for local
+communication but must not be allowed for public endpoints.
+#>
+function Invoke-BridgeRestMethod {
+    param(
+        [string]$Uri,
+        [string]$Method = 'Get',
+        [string]$Body,
+        [string]$ContentType,
+        [int]$TimeoutSec = 5
+    )
+
+    # Extract host from URI and verify it is a private address
+    $uriObj = [System.Uri]::new($Uri)
+    $host_ = $uriObj.Host
+    if (-not (Test-PrivateIPAddress $host_)) {
+        throw "Aether bridge communication is restricted to private/local IP addresses. Refused: $host_"
+    }
+
+    $params = @{
+        Uri                  = $Uri
+        Method               = $Method
+        TimeoutSec           = $TimeoutSec
+        SkipCertificateCheck = $true      # Safe: guarded by private-IP check above
+        ErrorAction          = 'Stop'
+    }
+    if ($Body)        { $params['Body']        = $Body }
+    if ($ContentType) { $params['ContentType'] = $ContentType }
+
+    return Invoke-RestMethod @params
+}
+
 function Find-Conduit {
     $controlDir = $script:Config.ControlDir
 
@@ -37,7 +98,7 @@ function Find-Conduit {
         try {
             $cachedConfig = Get-Content $configFile -Raw | ConvertFrom-Json
             if ($cachedConfig.conduit) {
-                $response = Invoke-RestMethod -Uri "https://$($cachedConfig.conduit)/api/config" -TimeoutSec 2 -SkipCertificateCheck -ErrorAction Stop
+                $response = Invoke-BridgeRestMethod -Uri "https://$($cachedConfig.conduit)/api/config" -TimeoutSec 2
                 if ($response.bridgeid) {
                     $result = @{ IP = $cachedConfig.conduit; Id = $response.bridgeid }
                     $script:Config.LastConduit = $result
@@ -159,7 +220,7 @@ ST: urn:schemas-upnp-org:device:basic:1
                 try { $kv.Value.Client.Dispose() } catch { Write-BotLog -Level Warn -Message "Task operation failed" -Exception $_ }
                 if ($connected) {
                     try {
-                        $response = Invoke-RestMethod -Uri "https://$($kv.Key)/api/config" -SkipCertificateCheck -TimeoutSec 2 -ErrorAction Stop
+                        $response = Invoke-BridgeRestMethod -Uri "https://$($kv.Key)/api/config" -TimeoutSec 2
                         if ($response.bridgeid) {
                             $result = @{ IP = $kv.Key; Id = $response.bridgeid }
                             $script:Config.LastConduit = $result
@@ -240,7 +301,7 @@ function Invoke-ConduitBond {
     )
     try {
         $body = @{ devicetype = "dotbot#aether" } | ConvertTo-Json -Compress
-        $response = Invoke-RestMethod -Uri "https://$IP/api" -Method Post -Body $body -ContentType "application/json" -SkipCertificateCheck -TimeoutSec 5 -ErrorAction Stop
+        $response = Invoke-BridgeRestMethod -Uri "https://$IP/api" -Method Post -Body $body -ContentType "application/json" -TimeoutSec 5
         if ($response -is [array] -and $response[0].success) {
             return @{ success = $true; username = $response[0].success.username }
         }
@@ -259,7 +320,7 @@ function Get-ConduitNodes {
         [Parameter(Mandatory)] [string]$Token
     )
     try {
-        $response = Invoke-RestMethod -Uri "https://$IP/api/$Token/lights" -SkipCertificateCheck -TimeoutSec 5 -ErrorAction Stop
+        $response = Invoke-BridgeRestMethod -Uri "https://$IP/api/$Token/lights" -TimeoutSec 5
         $nodes = @()
         foreach ($prop in $response.PSObject.Properties) {
             $light = $prop.Value
@@ -282,7 +343,7 @@ function Test-ConduitLink {
         [Parameter(Mandatory)] [string]$Token
     )
     try {
-        $null = Invoke-RestMethod -Uri "https://$IP/api/$Token/lights" -SkipCertificateCheck -TimeoutSec 3 -ErrorAction Stop
+        $null = Invoke-BridgeRestMethod -Uri "https://$IP/api/$Token/lights" -TimeoutSec 3
         return @{ valid = $true }
     } catch {
         return @{ valid = $false }
@@ -299,7 +360,7 @@ function Invoke-ConduitCommand {
     $results = @()
     foreach ($nodeId in $Nodes) {
         try {
-            $response = Invoke-RestMethod -Uri "https://$IP/api/$Token/lights/$nodeId/state" -Method Put -Body $State -ContentType "application/json" -SkipCertificateCheck -TimeoutSec 3 -ErrorAction Stop
+            $response = Invoke-BridgeRestMethod -Uri "https://$IP/api/$Token/lights/$nodeId/state" -Method Put -Body $State -ContentType "application/json" -TimeoutSec 3
             $results += @{ nodeId = $nodeId; success = $true }
         } catch {
             $results += @{ nodeId = $nodeId; success = $false; error = $_.Exception.Message }
@@ -308,4 +369,4 @@ function Invoke-ConduitCommand {
     return @{ success = $true; results = $results }
 }
 
-Export-ModuleMember -Function @('Initialize-AetherAPI', 'Find-Conduit', 'Get-AetherScanResult', 'Get-AetherConfig', 'Set-AetherConfig', 'Invoke-ConduitBond', 'Get-ConduitNodes', 'Test-ConduitLink', 'Invoke-ConduitCommand')
+Export-ModuleMember -Function @('Initialize-AetherAPI', 'Find-Conduit', 'Get-AetherScanResult', 'Get-AetherConfig', 'Set-AetherConfig', 'Invoke-ConduitBond', 'Get-ConduitNodes', 'Test-ConduitLink', 'Invoke-ConduitCommand', 'Test-PrivateIPAddress', 'Invoke-BridgeRestMethod')

@@ -74,12 +74,22 @@ function Invoke-RepoClone {
         }
     }
 
-    # Build clone URL with PAT authentication
+    # Build clone URL — keep the PAT out of the URL to avoid leaking it into
+    # .git/config, process listings, and log output.  Pass it via the
+    # GIT_ASKPASS helper instead (one-shot env var, never persisted).
     $orgHost = ($adoOrgUrl -replace 'https?://', '')
-    $cloneUrl = "https://$($adoPat)@$orgHost/$project/_git/$repo"
+    $cloneUrl = "https://$orgHost/$project/_git/$repo"
 
     try {
+        # Use a one-shot credential helper so the PAT is never embedded in the URL.
+        $env:GIT_ASKPASS_TOKEN = $adoPat
+        $askPassScript = Join-Path ([System.IO.Path]::GetTempPath()) "dotbot-git-askpass-$([System.Guid]::NewGuid().ToString('N').Substring(0,8)).ps1"
+        Set-Content -Path $askPassScript -Encoding UTF8 -Value 'Write-Output $env:GIT_ASKPASS_TOKEN'
+        $env:GIT_ASKPASS = "pwsh -NoProfile -File `"$askPassScript`""
         $cloneOutput = & git clone $cloneUrl $clonePath 2>&1
+        Remove-Item $askPassScript -Force -ErrorAction SilentlyContinue
+        Remove-Item Env:\GIT_ASKPASS -ErrorAction SilentlyContinue
+        Remove-Item Env:\GIT_ASKPASS_TOKEN -ErrorAction SilentlyContinue
         if ($LASTEXITCODE -ne 0) {
             $errorMsg = ($cloneOutput | Out-String).Trim()
             $errorMsg = $errorMsg -replace [regex]::Escape($adoPat), '***'
@@ -97,6 +107,9 @@ function Invoke-RepoClone {
             }
         }
     } catch {
+        Remove-Item $askPassScript -Force -ErrorAction SilentlyContinue
+        Remove-Item Env:\GIT_ASKPASS -ErrorAction SilentlyContinue
+        Remove-Item Env:\GIT_ASKPASS_TOKEN -ErrorAction SilentlyContinue
         return @{
             success    = $false
             error_type = "exception"
