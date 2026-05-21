@@ -837,7 +837,7 @@ const Aether = (function() {
 
         if (lastEventEl && _lastEvent) {
             const _t = _lastEvent.time;
-            const timeStr = `${_t.getHours().toString().padStart(2,'0')}:${_t.getMinutes().toString().padStart(2,'0')}`;
+            const timeStr = `${_t.getHours().toString().padStart(2,'0')}:${_t.getMinutes().toString().padStart(2,'0')}:${_t.getSeconds().toString().padStart(2,'0')}`;
             const colorVar = _lastEvent.type === 'START' ? '--color-success' :
                              _lastEvent.type === 'COMPLETE' ? '--color-secondary' : '--color-primary';
             lastEventEl.innerHTML = `<span class="event-type" style="color: var(${colorVar})">${_lastEvent.type}</span><span class="event-time">${timeStr}</span>`;
